@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0e1116">
+<title>SacchinWatch</title>
+<style>
+  :root { --bg:#0e1116; --card:#171b22; --line:#262c36; --text:#e8ecf1; --muted:#8a93a0;
+          --accent:#4f9cff; --ok:#3ecf8e; --warn:#f5a524; --bad:#f25f5c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background:var(--bg); color:var(--text); }
+  main { max-width:480px; margin:0 auto; padding:16px; display:grid; gap:12px; }
+  header { display:flex; align-items:center; justify-content:space-between; padding:4px 2px; }
+  h1 { font-size:20px; margin:0; }
+  .pill { font-size:13px; padding:4px 10px; border-radius:999px; background:var(--line); color:var(--muted); }
+  .pill.on { background:rgba(62,207,142,.15); color:var(--ok); }
+  section { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
+  h2 { font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.06em;
+       color:var(--muted); margin:0 0 10px; }
+  button { font:inherit; border:0; border-radius:10px; padding:12px 14px; background:var(--line);
+           color:var(--text); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; font-weight:600; width:100%; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  button:active:not(:disabled) { transform:scale(.98); }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  input { font:inherit; width:100%; padding:12px; border-radius:10px; border:1px solid var(--line);
+          background:var(--bg); color:var(--text); }
+  .hint { font-size:12px; color:var(--muted); margin-top:6px; display:flex; justify-content:space-between; }
+  .stats { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .stat { background:var(--bg); border-radius:10px; padding:10px; text-align:center; }
+  .stat b { display:block; font-size:28px; font-variant-numeric:tabular-nums; }
+  .stat span { font-size:12px; color:var(--muted); }
+  #quality { text-align:center; font-size:13px; margin-top:8px; color:var(--muted); }
+  #log { font:12px/1.5 ui-monospace, Menlo, Consolas, monospace; color:var(--muted);
+         max-height:140px; overflow:auto; white-space:pre-wrap; }
+  .error { background:rgba(242,95,92,.12); border-color:rgba(242,95,92,.4); color:#ffb3b1; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>⌚ SacchinWatch</h1>
+    <span id="status" class="pill">Disconnected</span>
+  </header>
+
+  <section id="unsupported" class="error" hidden>
+    Web Bluetooth isn't available here. Open this page in <b>Chrome on Android</b>,
+    over <b>https://</b>, with Bluetooth and Location turned on.
+  </section>
+
+  <section>
+    <button id="connect" class="primary">Connect to watch</button>
+    <div class="row" style="margin-top:8px">
+      <button id="sync" disabled>Sync time</button>
+      <button id="disconnect" disabled>Disconnect</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Send message</h2>
+    <input id="msg" maxlength="200" placeholder="Type a message for your wrist">
+    <div class="hint"><span>English letters show best; others become “?”</span><span id="bytes">0/100</span></div>
+    <button id="send" class="primary" style="margin-top:8px" disabled>Send</button>
+  </section>
+
+  <section>
+    <h2>Buzz</h2>
+    <div class="row">
+      <button data-vibe="1" disabled>Short</button>
+      <button data-vibe="2" disabled>Double</button>
+      <button data-vibe="3" disabled>Long</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Health</h2>
+    <div class="stats">
+      <div class="stat"><b id="bpm">--</b><span>BPM</span></div>
+      <div class="stat"><b id="spo2">--</b><span>SpO₂ %</span></div>
+    </div>
+    <div id="quality">Measure on the watch: Heart rate screen → Select</div>
+  </section>
+
+  <section>
+    <h2>Battery</h2>
+    <div class="stat"><b id="battery">--</b><span>%</span></div>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script type="module">
+import { UUID, encodeTime, encodeMessage, encodeVibrate, decodeHeartRate, MAX_MESSAGE_BYTES } from './protocol.js';
+
+const $ = (id) => document.getElementById(id);
+const actionButtons = [$('sync'), $('disconnect'), $('send'), ...document.querySelectorAll('[data-vibe]')];
+
+let device = null;
+let chars = {};
+let queue = Promise.resolve();          // GATT operations must not overlap
+
+function log(text) {
+  const t = new Date().toLocaleTimeString();
+  $('log').textContent = `${t}  ${text}\n` + $('log').textContent;
+}
+
+function setConnected(on) {
+  $('status').textContent = on ? 'Connected' : 'Disconnected';
+  $('status').classList.toggle('on', on);
+  $('connect').disabled = on;
+  $('connect').textContent = device && !on ? 'Reconnect' : 'Connect to watch';
+  actionButtons.forEach((b) => (b.disabled = !on));
+}
+
+function write(name, bytes) {
+  queue = queue.then(() => chars[name].writeValueWithResponse(bytes)).catch((e) => log(`Write failed: ${e.message}`));
+  return queue;
+}
+
+async function connect() {
+  try {
+    if (!device) {
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: 'SacchinWatch' }, { services: [UUID.service] }],
+        optionalServices: [UUID.service, UUID.batteryService],
+      });
+      device.addEventListener('gattserverdisconnected', () => {
+        log('Watch disconnected');
+        setConnected(false);
+      });
+    }
+    $('status').textContent = 'Connecting…';
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(UUID.service);
+    for (const name of ['time', 'message', 'vibrate', 'heartRate']) {
+      chars[name] = await svc.getCharacteristic(UUID[name]);
+    }
+
+    chars.heartRate.addEventListener('characteristicvaluechanged', (e) => showHeartRate(e.target.value));
+    await chars.heartRate.startNotifications();
+
+    try {
+      const batt = await (await server.getPrimaryService(UUID.batteryService)).getCharacteristic(UUID.batteryLevel);
+      batt.addEventListener('characteristicvaluechanged', (e) => ($('battery').textContent = e.target.value.getUint8(0)));
+      $('battery').textContent = (await batt.readValue()).getUint8(0);
+      await batt.startNotifications();
+    } catch (e) { log(`Battery not available: ${e.message}`); }
+
+    setConnected(true);
+    log(`Connected to ${device.name}`);
+    await syncTime();
+  } catch (e) {
+    log(`Connect failed: ${e.message}`);
+    setConnected(false);
+  }
+}
+
+async function syncTime() {
+  await write('time', encodeTime());
+  log(`Time synced: ${new Date().toLocaleString()}`);
+}
+
+function showHeartRate(view) {
+  const { bpm, spo2, quality } = decodeHeartRate(view);
+  const labels = ['No finger detected', 'Low quality — hold still, press lightly', 'Good reading'];
+  $('bpm').textContent = bpm || '--';
+  $('spo2').textContent = spo2 || '--';
+  $('quality').textContent = labels[quality] ?? 'Unknown';
+  log(`Heart rate: ${bpm} bpm, SpO2 ${spo2}%, quality ${quality}`);
+}
+
+// ---- UI wiring ----
+if (!('bluetooth' in navigator)) {
+  $('unsupported').hidden = false;
+  $('connect').disabled = true;
+}
+
+$('connect').onclick = connect;
+$('sync').onclick = syncTime;
+$('disconnect').onclick = () => device?.gatt.disconnect();
+
+$('msg').oninput = () => ($('bytes').textContent = `${encodeMessage($('msg').value).length}/${MAX_MESSAGE_BYTES}`);
+async function sendMessage() {
+  const text = $('msg').value.trim();
+  if (!text) return;
+  await write('message', encodeMessage(text));
+  log(`Sent: ${text}`);
+  $('msg').value = '';
+  $('bytes').textContent = `0/${MAX_MESSAGE_BYTES}`;
+}
+$('send').onclick = sendMessage;
+$('msg').onkeydown = (e) => { if (e.key === 'Enter' && !$('send').disabled) sendMessage(); };
+
+document.querySelectorAll('[data-vibe]').forEach((b) => {
+  b.onclick = () => { write('vibrate', encodeVibrate(Number(b.dataset.vibe))); log(`Buzz ${b.textContent}`); };
+});
+</script>
+</body>
+</html>
